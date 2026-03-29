@@ -1,93 +1,157 @@
 # GA4 Channel Diagnostics Assistant
 
-I built this project to make GA4 channel performance easier to investigate in plain English.
+A Streamlit analytics assistant that turns plain-English questions about GA4 channel performance into structured, evidence-backed answers.
 
-A user can ask questions like:
+Instead of making a stakeholder click through dashboards to figure out what changed, the app routes questions like:
 
 - Why did revenue drop last week?
 - Which channel underperformed most?
 - Compare email and paid search
 
-The app routes the question to the right analysis, runs the numbers, and returns a structured answer with evidence. If an LLM key is available, it can also write the explanation in plain English. If not, the app falls back to a deterministic template.
+It then runs the relevant analysis, returns the answer in business-friendly language, and shows the supporting evidence.
 
-![Python](https://img.shields.io/badge/python-3.9+-blue) ![Streamlit](https://img.shields.io/badge/streamlit-app-red)
+The core logic goes through these steps: question routing, period comparisons, revenue-driver decomposition, channel mix analysis, and weekday-aware anomaly detection. An optional LLM layer can rewrite the explanation in plain English, but only if it passes a faithfulness audit against the computed results.
 
-## Why I made it
+![Python](https://img.shields.io/badge/python-3.9+-blue)
+![Streamlit](https://img.shields.io/badge/streamlit-app-red)
 
-Most dashboards are good at showing what happened, but they do not do much to explain why it happened.
+## Why I built it
 
-I wanted to build something closer to how a stakeholder actually asks questions. Instead of clicking through charts, a user can type a question like "Why did revenue drop?" and get a structured answer backed by calculations.
+I believe most dashboards are good at showing what happened, but fewer are good at explaining why it happened.
+
+I wanted to build something closer to the way a business user actually asks questions. A stakeholder usually asks:
+
+- What changed?
+- Why did it change?
+- Which channel is the problem?
+- What should I check first?
+
+I moved the project to try to answer those questions with structured analytics rather than open-ended text generation.
 
 ## What the app does
 
-The app supports four main question types:
+The app supports four workflows:
 
-- Summary: gives a period over period view of revenue, sessions, and conversions
-- Diagnose: breaks revenue change into traffic, conversion rate, and revenue per conversion effects
-- Underperform: identifies the weakest channel and suggests what to check next
-- Compare: compares two channels side by side
+### 1. Summary
+Returns a period-over-period view of:
+- revenue
+- sessions
+- conversions
 
-## How it works
+### 2. Diagnose
+Breaks revenue change into three drivers:
+- traffic effect
+- conversion effect
+- value per conversion effect
 
-### Routing
+### 3. Underperform
+Finds the weakest channel and checks whether the issue looks more like:
+- traffic loss
+- conversion weakness
+- lower value per conversion
 
-routing.py uses a keyword-based intent classifier to map a question to one of four handlers:
+### 4. Compare
+Compares two channels side by side across:
+- sessions
+- conversions
+- conversion rate
+- revenue
+- spend and ROAS, when available
 
-- summary
-- diagnose
-- underperform
-- compare
+Each answer is paired with an evidence table so the output stays tied to the underlying numbers.
 
-### Core analysis
+## Core ideas behind the project
 
-app.py contains the main analytics logic.
+### Revenue bridge decomposition
 
-Each handler runs a different analysis:
+The diagnosis workflow decomposes revenue change into three parts:
 
-- summary_analysis: period over period summary of revenue, sessions, and conversions
-- diagnose_analysis: bridge decomposition plus a mix effect layer
-- underperform_analysis: identifies the weakest channel and checks whether the main issue looks more like traffic or conversion rate
-- compare_analysis: side by side comparison of two channels
+- Traffic effect: did revenue move because session volume changed?
+- Conversion effect: did revenue move because conversion efficiency changed?
+- Value effect: did revenue move because revenue per conversion changed?
 
-### Revenue bridge
-
-The diagnosis flow decomposes revenue change into three effects:
-
-- Traffic effect
-- Conversion effect
-- Value effect
-
-A drop in revenue can come from fewer sessions, worse conversion efficiency, lower revenue per conversion, or some combination of all three.
+A revenue decline becomes much easier to investigate once it is broken into those components.
 
 ### Mix effect
 
-I also added a mix effect layer.
+Aggregate revenue can fall even when nothing changes much within each channel if traffic shifts away from stronger channels and toward weaker ones.
 
-A business can lose revenue even when nothing changes much within each channel if traffic shifts away from stronger channels and toward weaker ones. The mix effect estimates the impact of that composition shift while holding prior-period efficiency fixed.
+The app estimates a mix effect by holding prior-period efficiency fixed and measuring how changing session share across channels affected revenue. This, in turn, helps separate “a channel got worse” from “traffic composition changed.”
 
 ### Weekday-aware anomaly detection
 
-detect_recent_anomalies.py compares each day only to prior observations from the same weekday.
+A naive rolling z-score can flag false positives when weekly seasonality is strong. To reduce the issue, the anomaly logic compares each day only to prior observations from the same weekday:
+- Monday vs past Mondays
+- Saturday vs past Saturdays
 
-Monday gets compared to past Mondays. Saturday gets compared to past Saturdays.
+This logic makes the anomaly scan more believable for ecommerce-style traffic patterns.
 
-A normal rolling window can overreact to weekly seasonality, so I changed the anomaly logic to make it more believable for ecommerce data.
+### Controlled LLM explanation layer
 
-### LLM explanation layer
+The LLM is optional.When an API key is available, the app sends structured context to OpenAI or Groq and asks for a concise explanation. The model does not decide the analysis. It only rewrites computed results into plain English.
 
-llm.py sends structured context to OpenAI or Groq and asks for a plain-English explanation.
+Before the app shows the LLM answer, it runs a faithfulness audit to check whether the response preserved:
+- the direction of change
+- the main driver
+- the weakest channel
+- the approximate magnitude
 
-I did not want the model to just freestyle an answer, so I added a faithfulness audit. The app checks whether the LLM preserved the key driver and weakest channel before using the response. If the audit fails, the app falls back to a deterministic template.
+If the audit fails, the app falls back to a deterministic template, which keeps the explanation layer constrained by the actual numbers.
 
-## Benchmark results
+## How it works
 
-I evaluated the system across 500 simulated scenarios with seeded shocks in:
+### 1. Question routing
 
+A keyword-based intent classifier maps the user’s question to one of four handlers:
+- `summary`
+- `diagnose`
+- `underperform`
+- `compare`
+
+The routing layer keeps the app simple and predictable for common analyst-style questions.
+
+### 2. Period aggregation
+
+The app summarizes channel performance across the latest 7 days and the prior 7 days.
+
+Metrics include:
+- sessions
+- conversions
+- revenue
+- conversion rate
+- revenue per conversion
+- spend and ROAS, if spend exists in the dataset
+
+I used DuckDB inside the app for period aggregation so the same logic scales better than repeated in-memory groupbys as data grows.
+
+### 3. Analytical handlers
+
+Each routed question triggers a different analysis:
+
+- `summary_analysis`: period-over-period overview
+- `diagnose_analysis`: bridge decomposition plus mix effect
+- `underperform_analysis`: weakest channel diagnosis
+- `compare_analysis`: side-by-side channel comparison
+
+### 4. Evidence and explanation
+
+Each handler returns:
+- a business-friendly answer
+- a structured evidence table
+- an optional LLM explanation audit
+
+So, the numbers come first, and then the wording comes second.
+
+### Benchmark and evaluation
+
+I tested the project on 500 simulated scenarios with seeded shocks in:
 - sessions
 - conversion rate
 - revenue per conversion
 
-### Diagnosis performance
+The goal was to see whether the system could correctly identify the channel and driver behind a performance problem.
+
+#### Diagnosis performance
 
 | Metric | Accuracy |
 |---|---:|
@@ -95,121 +159,154 @@ I evaluated the system across 500 simulated scenarios with seeded shocks in:
 | Metric accuracy | 85.8% |
 | Exact root-cause accuracy | 79.2% |
 
-Diagnosis accuracy stays stable across anomaly thresholds because the diagnosis module is driven by the bridge decomposition, not by anomaly flagging.
+Diagnosis accuracy stays stable across anomaly thresholds because diagnosis is driven by bridge decomposition, not by anomaly flagging alone.
 
-### Anomaly detection
+#### Anomaly detection tradeoff
 
 | z threshold | Exact accuracy | False positive rate |
 |---|---:|---:|
 | 2.0 | 38.1% | 3.5% |
 
-Higher thresholds reduced false positives, but they also reduced recall enough that z = 2.0 was the most useful setting in this version.
+Higher thresholds reduced false positives, but they also reduced recall enough that `z = 2.0` was the most useful balance in this version.
 
-## Project structure
+### Project structure
 
-```
-├── app.py                        
-├── detect_recent_anomalies.py    
-├── llm.py                        
-├── routing.py                    
-├── simulation.py                 
-├── benchmark.py                  
-├── test_questions.py             
+```text
+├── app.py
+├── detect_recent_anomalies.py
+├── llm.py
+├── routing.py
+├── simulation.py
+├── benchmark.py
+├── test_questions.py
 ├── requirements.txt
 └── data/
     └── processed/
-        └── ga4_daily_channel_metrics.csv   
+        └── ga4_daily_channel_metrics.csv
 ```
 
 ## Setup
 
 ### 1. Clone the repo
 
+```bash
 git clone https://github.com/JustinJ-Lo/ga4-channel-diagnostics.git
 cd ga4-channel-diagnostics
+```
 
 ### 2. Create and activate a virtual environment
 
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
+```
 
 For Windows:
 
-.venv\\Scripts\\activate
+```bash
+.venv\Scripts\activate
+```
 
 ### 3. Install dependencies
 
+```bash
 pip install -r requirements.txt
+```
 
 ### 4. Add your data
 
-Put your GA4 daily channel metrics CSV here:
+Place your GA4 daily channel metrics CSV here:
 
+```text
 data/processed/ga4_daily_channel_metrics.csv
+```
 
 Required columns:
+- `date`
+- `channel`
+- `sessions`
+- `conversions`
+- `revenue`
 
-- date
-- channel
-- sessions
-- conversions
-- revenue
+Optional:
+- `spend`
 
-Optional columns:
+The app runs without spend. Compare outputs adjust automatically when spend is missing.
 
-- spend
-
-The app can still run without spend. Compare outputs will adjust based on what is available in the dataset.
-
-### 5. Configure the LLM layer if you want
+### 5. Configure the LLM layer if wanted
 
 The app works without an API key.
 
-An API key is only needed if you want model-written explanations.
+Set one of the following only if you want model-written explanations:
 
 For OpenAI:
-
+```bash
 OPENAI_API_KEY=sk-...
+```
 
 For Groq:
-
+```bash
 GROQ_API_KEY=gsk_...
+```
 
-The app checks for OpenAI first, then Groq.
+Provider order:
+1. OpenAI
+2. Groq
+
+Default models:
+- OpenAI: `gpt-4o-mini`
+- Groq: `llama-3.3-70b-versatile`
 
 ### 6. Run the app
 
+```bash
 streamlit run app.py
+```
 
 ### 7. Run the benchmark
 
+```bash
 python3 benchmark.py
+```
 
-### 8. Run the routing test suite
+### 8. Run the routing tests
 
+```bash
 python3 test_questions.py
+```
 
-## LLM providers
+## Example questions
 
-| Provider | Env var | Default model |
-|---|---|---|
-| OpenAI | OPENAI_API_KEY | gpt-4o-mini |
-| Groq | GROQ_API_KEY | llama-3.3-70b-versatile |
+Some prompts to try:
+- Why did revenue drop in the last 7 days?
+- Which channel underperformed most?
+- Compare email and paid search
+- Compare direct and referral
+- Summarize key changes in the last 7 days
 
-## What I think is most useful here
+## What matters most in this project
 
-A few parts of the project matter more than the rest:
+A few parts are more important than the rest:
 
-- weekday-aware anomaly detection, because it handles weekly seasonality better than a naive rolling window
-- bridge decomposition, because it turns a vague revenue drop into specific drivers
-- the LLM audit, because it keeps the explanation layer tied to the actual numbers
-- the benchmark harness, because it gives me a way to evaluate whether the system is doing something useful instead of just sounding smart
+- weekday-aware anomaly detection, because it reduces false positives from weekly seasonality
+- bridge decomposition, because it turns a vague revenue change into specific drivers
+- mix effect analysis, because it separates within-channel weakness from composition shifts
+- LLM faithfulness auditing, because it keeps generated explanations tied to computed evidence
+- benchmarking, because it tests whether the diagnosis logic is useful instead of only sounding convincing
 
 ## Limits
 
-A few caveats are worth keeping in mind:
+A few limits to consider:
 
 - Mix effect is a decomposition, not proof of causality
-- Anomaly detection still depends on a fairly small same-weekday history
-- Real performance depends on the quality of the input GA4 export
-- The LLM layer is optional and only used when its response passes the audit checks
+- Anomaly detection still relies on a fairly small same-weekday history
+- Routing is rule-based, not a learned NLP classifier
+- Benchmark results come from simulated shocks, not labeled real-world incidents
+- Output quality depends on the quality of the input GA4 export
+- The LLM layer is optional and never replaces the underlying analysis
+
+## Why I think the project is useful
+
+My goal was not to build another dashboard. It was to build a lightweight analytics assistant that helps a user to see not just that "Revenue has gone down", but to see that “Paid Search drove the decline, and the biggest issue was traffic volume”.
+
+
