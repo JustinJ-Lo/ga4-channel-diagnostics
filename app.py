@@ -2,6 +2,7 @@ import streamlit as st
 from llm import generate_summary_structured, audit_faithfulness, llm_status
 import pandas as pd
 import numpy as np
+import duckdb
 from pathlib import Path
 
 ANOMALY_Z_THRESHOLD = 2.0
@@ -66,19 +67,39 @@ def get_periods(df):
 
 
 def summarize_period(df, start_date, end_date):
-    period = df[(df["date"] >= start_date) & (df["date"] <= end_date)].copy()
+    """
+    Aggregates channel metrics for a date range using DuckDB SQL.
 
+    Why DuckDB: pandas loads and scans the entire DataFrame in memory for
+    every period. DuckDB pushes the WHERE + GROUP BY into a query engine,
+    returning only the ~5 channel rows Streamlit actually needs. For the
+    current CSV this is negligible, but it scales cleanly to multi-million
+    row GA4 BigQuery exports without changing any downstream code.
+    """
     has_spend = "spend" in df.columns
+    spend_agg = "SUM(spend) AS spend," if has_spend else ""
 
-    agg_dict = dict(
-        sessions=("sessions", "sum"),
-        conversions=("conversions", "sum"),
-        revenue=("revenue", "sum"),
-    )
-    if has_spend:
-        agg_dict["spend"] = ("spend", "sum")
+    query = f"""
+        SELECT
+            channel,
+            SUM(sessions)    AS sessions,
+            SUM(conversions) AS conversions,
+            SUM(revenue)     AS revenue,
+            {spend_agg}
+            1 AS _dummy
+        FROM df
+        WHERE date >= '{start_date}'
+          AND date <= '{end_date}'
+        GROUP BY channel
+        ORDER BY channel
+    """
 
-    by_channel = period.groupby("channel", as_index=False).agg(**agg_dict)
+    # DuckDB can reference local pandas DataFrames by variable name.
+    # We use a fresh in-process connection so there's no state leakage
+    # between Streamlit reruns.
+    con = duckdb.connect()
+    by_channel = con.execute(query).df().drop(columns=["_dummy"])
+    con.close()
 
     by_channel["conversion_rate"] = np.where(
         by_channel["sessions"] > 0,
@@ -818,6 +839,9 @@ if submitted:
         if llm_audit is None:
             st.write("No LLM audit available. Either the toggle was off, the model was unavailable, or the response used fallback text.")
         else:
+            score = llm_audit.get("score")
+            if score is not None:
+                st.progress(score, text=f"Faithfulness score: {score:.2f} / 1.00  ({'passed' if llm_audit.get('passed') else 'fallback'})")
             st.json(llm_audit)
 
     with st.expander("See raw data sample"):

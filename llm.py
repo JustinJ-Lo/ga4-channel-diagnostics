@@ -164,65 +164,128 @@ def generate_summary(context: Dict[str, Any]) -> Optional[str]:
 
 
 def audit_faithfulness(llm_result, context):
+    """
+    Scored faithfulness audit (0.0 – 1.0).
+
+    Replaces the old binary pass/fail with a weighted score across five checks.
+    The LLM response is accepted only if score >= PASS_THRESHOLD (0.70).
+    This means a response that gets the main driver and direction right but
+    misses the exact channel name by phrasing still passes, instead of being
+    silently discarded.
+
+    Weights:
+        has_summary       0.20  — response must contain text at all
+        direction_correct 0.30  — highest weight; direction wrong = misleading
+        main_driver       0.25  — key driver correctly named
+        weakest_channel   0.20  — weakest channel named (skipped for compare)
+        magnitude_ok      0.05  — bonus: key percentage appears in text
+    """
+    PASS_THRESHOLD = 0.70
+
     if not llm_result:
         return {
             "used_llm": False,
+            "score": 0.0,
             "passed": False,
             "checks": {
                 "has_summary": False,
+                "direction_correct": None,
                 "main_driver_matches": False,
                 "weakest_channel_matches": None,
+                "magnitude_ok": None,
             },
-            "notes": ["LLM result missing; fallback likely used."],
+            "notes": ["LLM result missing; fallback used."],
         }
 
     summary = (llm_result.get("summary") or "").lower()
+    question_type = str(context.get("question_type", "")).strip().lower()
     main_driver_expected = str(context.get("main_driver", "")).strip().lower()
     weakest_channel_expected = str(context.get("weakest_channel", "")).strip().lower()
-    question_type = str(context.get("question_type", "")).strip().lower()
+    rev_chg = context.get("rev_chg")
 
+    # --- Check 1: summary is non-empty (weight 0.20) ---
     has_summary = bool(summary.strip())
 
-    main_driver_matches = (
-        bool(main_driver_expected) and main_driver_expected in summary
-    ) or (
-        bool(main_driver_expected)
-        and main_driver_expected == str(llm_result.get("main_driver", "")).strip().lower()
-    )
+    # --- Check 2: direction correct (weight 0.30) ---
+    # Does the summary correctly say whether revenue went up or down?
+    direction_correct = None
+    if rev_chg is not None:
+        negative_words = {"declin", "drop", "fell", "fall", "decreas", "down", "lost", "loss", "worse"}
+        positive_words = {"increas", "grew", "rose", "gain", "up", "improv", "better"}
+        if rev_chg < 0:
+            direction_correct = any(w in summary for w in negative_words)
+        elif rev_chg > 0:
+            direction_correct = any(w in summary for w in positive_words)
+        else:
+            direction_correct = True  # flat revenue; don't penalize
 
-    if question_type == "compare" or not weakest_channel_expected:
-        weakest_channel_matches = None
-    else:
-        weakest_channel_matches = (
-            weakest_channel_expected in summary
-        ) or (
-            weakest_channel_expected
-            == str(llm_result.get("weakest_channel", "")).strip().lower()
+    # --- Check 3: main driver mentioned (weight 0.25) ---
+    main_driver_matches = False
+    if main_driver_expected:
+        main_driver_matches = (
+            main_driver_expected in summary
+            or main_driver_expected == str(llm_result.get("main_driver", "")).strip().lower()
         )
 
-    passed = has_summary and (
-        not main_driver_expected or main_driver_matches
-    ) and (
-        weakest_channel_matches in [True, None]
-    )
+    # --- Check 4: weakest channel named (weight 0.20, skipped for compare) ---
+    weakest_channel_matches = None
+    if question_type != "compare" and weakest_channel_expected:
+        weakest_channel_matches = (
+            weakest_channel_expected in summary
+            or weakest_channel_expected == str(llm_result.get("weakest_channel", "")).strip().lower()
+        )
 
+    # --- Check 5: magnitude in ballpark (weight 0.05, bonus) ---
+    # Just checks that the rounded percentage string appears somewhere in the summary.
+    # e.g. if rev_chg = -0.032, looks for "3.2%" in the text.
+    magnitude_ok = None
+    expected_pct = None
+    if rev_chg is not None:
+        expected_pct = f"{abs(rev_chg):.1%}"   # e.g. "3.2%"
+        magnitude_ok = expected_pct in summary
+
+    # --- Score ---
+    score = 0.0
+    score += 0.20 if has_summary else 0.0
+    score += 0.30 if direction_correct else 0.0
+    score += 0.25 if main_driver_matches else 0.0
+    # For compare questions weakest_channel is N/A — don't penalize
+    if weakest_channel_matches is True:
+        score += 0.20
+    elif weakest_channel_matches is None:
+        score += 0.20
+    score += 0.05 if magnitude_ok else 0.0
+
+    passed = score >= PASS_THRESHOLD
+
+    # --- Notes for the audit expander in the UI ---
     notes = []
     if not has_summary:
         notes.append("Summary text was empty.")
+    if direction_correct is False:
+        label = "decline" if (rev_chg is not None and rev_chg < 0) else "increase"
+        notes.append(f"Direction mismatch: expected {label} language but summary may not reflect it.")
     if main_driver_expected and not main_driver_matches:
-        notes.append(f"Expected main driver '{context.get('main_driver')}' was not clearly preserved.")
+        notes.append(f"Main driver '{context.get('main_driver')}' not clearly preserved.")
     if weakest_channel_matches is False:
-        notes.append(f"Expected weakest channel '{context.get('weakest_channel')}' was not clearly preserved.")
+        notes.append(f"Weakest channel '{context.get('weakest_channel')}' not clearly preserved.")
+    if magnitude_ok is False and expected_pct:
+        notes.append(f"Expected magnitude '{expected_pct}' not found in summary (minor).")
     if passed:
-        notes.append("Structured explanation is consistent with the key supplied fields.")
+        notes.append(f"Score {score:.2f} ≥ {PASS_THRESHOLD} — response accepted.")
+    else:
+        notes.append(f"Score {score:.2f} < {PASS_THRESHOLD} — fallback used.")
 
     return {
         "used_llm": True,
+        "score": round(score, 2),
         "passed": passed,
         "checks": {
             "has_summary": has_summary,
+            "direction_correct": direction_correct,
             "main_driver_matches": main_driver_matches,
             "weakest_channel_matches": weakest_channel_matches,
+            "magnitude_ok": magnitude_ok,
         },
         "notes": notes,
     }
